@@ -25,7 +25,7 @@ RUN /bin/bash scripts/build.sh
 FROM alpine:3.7
 
 RUN apk --no-cache add ca-certificates
-RUN apk update && apk upgrade && apk add --no-cache bash git
+RUN apk update && apk upgrade && apk add --no-cache bash ssh git
 
 WORKDIR /usr/local/bin
 
