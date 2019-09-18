@@ -22,7 +22,7 @@ RUN /bin/bash scripts/build.sh
 
 # Take building output and copy it into a clean image
 
-FROM alpine:3.7
+FROM alpine:3.10
 
 RUN apk --no-cache add ca-certificates
 RUN apk update && apk upgrade && apk add --no-cache bash openssh-client git
