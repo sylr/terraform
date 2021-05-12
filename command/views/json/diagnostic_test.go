@@ -246,6 +246,44 @@ func TestNewDiagnostic(t *testing.T) {
 				},
 			},
 		},
+		"error with unset highlight end position": {
+			&hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "There is no end",
+				Detail:   "But there is a beginning",
+				Subject: &hcl.Range{
+					Filename: "test.tf",
+					Start:    hcl.Pos{Line: 1, Column: 16, Byte: 15},
+					End:      hcl.Pos{Line: 0, Column: 0, Byte: 0},
+				},
+			},
+			&Diagnostic{
+				Severity: "error",
+				Summary:  "There is no end",
+				Detail:   "But there is a beginning",
+				Range: &DiagnosticRange{
+					Filename: "test.tf",
+					Start: Pos{
+						Line:   1,
+						Column: 16,
+						Byte:   15,
+					},
+					End: Pos{
+						Line:   1,
+						Column: 17,
+						Byte:   16,
+					},
+				},
+				Snippet: &DiagnosticSnippet{
+					Context:              strPtr(`resource "test_resource" "test"`),
+					Code:                 `resource "test_resource" "test" {`,
+					StartLine:            1,
+					HighlightStartOffset: 15,
+					HighlightEndOffset:   16,
+					Values:               []DiagnosticExpressionValue{},
+				},
+			},
+		},
 		"error with source code subject and known expression": {
 			&hcl.Diagnostic{
 				Severity: hcl.DiagError,
@@ -355,6 +393,62 @@ func TestNewDiagnostic(t *testing.T) {
 						{
 							Traversal: `var.boop["hello!"]`,
 							Statement: `has a sensitive value`,
+						},
+					},
+				},
+			},
+		},
+		"error with source code subject and expression referring to a collection containing a sensitive value": {
+			&hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Wrong noises",
+				Detail:   "Biological sounds are not allowed",
+				Subject: &hcl.Range{
+					Filename: "test.tf",
+					Start:    hcl.Pos{Line: 2, Column: 9, Byte: 42},
+					End:      hcl.Pos{Line: 2, Column: 26, Byte: 59},
+				},
+				Expression: hcltest.MockExprTraversal(hcl.Traversal{
+					hcl.TraverseRoot{Name: "var"},
+					hcl.TraverseAttr{Name: "boop"},
+				}),
+				EvalContext: &hcl.EvalContext{
+					Variables: map[string]cty.Value{
+						"var": cty.ObjectVal(map[string]cty.Value{
+							"boop": cty.MapVal(map[string]cty.Value{
+								"hello!": cty.StringVal("bleurgh").Mark("sensitive"),
+							}),
+						}),
+					},
+				},
+			},
+			&Diagnostic{
+				Severity: "error",
+				Summary:  "Wrong noises",
+				Detail:   "Biological sounds are not allowed",
+				Range: &DiagnosticRange{
+					Filename: "test.tf",
+					Start: Pos{
+						Line:   2,
+						Column: 9,
+						Byte:   42,
+					},
+					End: Pos{
+						Line:   2,
+						Column: 26,
+						Byte:   59,
+					},
+				},
+				Snippet: &DiagnosticSnippet{
+					Context:              strPtr(`resource "test_resource" "test"`),
+					Code:                 (`  foo = var.boop["hello!"]`),
+					StartLine:            (2),
+					HighlightStartOffset: (8),
+					HighlightEndOffset:   (25),
+					Values: []DiagnosticExpressionValue{
+						{
+							Traversal: `var.boop`,
+							Statement: `is map of string with 1 element`,
 						},
 					},
 				},
@@ -642,6 +736,11 @@ func TestNewDiagnostic(t *testing.T) {
 				"diagnostic",
 				fmt.Sprintf("%s.json", strings.ReplaceAll(name, " ", "-")),
 			)
+
+			// Generate golden reference by uncommenting the next two lines:
+			// gotBytes = append(gotBytes, '\n')
+			// os.WriteFile(filename, gotBytes, 0644)
+
 			wantFile, err := os.Open(filename)
 			if err != nil {
 				t.Fatalf("failed to open golden file: %s", err)

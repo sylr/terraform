@@ -84,6 +84,14 @@ type change struct {
 	// display of sensitive values in user interfaces.
 	BeforeSensitive json.RawMessage `json:"before_sensitive,omitempty"`
 	AfterSensitive  json.RawMessage `json:"after_sensitive,omitempty"`
+
+	// ReplacePaths is an array of arrays representing a set of paths into the
+	// object value which resulted in the action being "replace". This will be
+	// omitted if the action is not replace, or if no paths caused the
+	// replacement (for example, if the resource was tainted). Each path
+	// consists of one or more steps, each of which will be a number or a
+	// string.
+	ReplacePaths json.RawMessage `json:"replace_paths,omitempty"`
 }
 
 type output struct {
@@ -213,7 +221,11 @@ func (p *plan) marshalResourceChanges(changes *plans.Changes, schemas *terraform
 			if err != nil {
 				return err
 			}
-			bs := sensitiveAsBool(changeV.Before.MarkWithPaths(rc.BeforeValMarks))
+			marks := rc.BeforeValMarks
+			if schema.ContainsSensitive() {
+				marks = append(marks, schema.ValueMarks(changeV.Before, nil)...)
+			}
+			bs := sensitiveAsBool(changeV.Before.MarkWithPaths(marks))
 			beforeSensitive, err = ctyjson.Marshal(bs, bs.Type())
 			if err != nil {
 				return err
@@ -238,7 +250,11 @@ func (p *plan) marshalResourceChanges(changes *plans.Changes, schemas *terraform
 				}
 				afterUnknown = unknownAsBool(changeV.After)
 			}
-			as := sensitiveAsBool(changeV.After.MarkWithPaths(rc.AfterValMarks))
+			marks := rc.AfterValMarks
+			if schema.ContainsSensitive() {
+				marks = append(marks, schema.ValueMarks(changeV.After, nil)...)
+			}
+			as := sensitiveAsBool(changeV.After.MarkWithPaths(marks))
 			afterSensitive, err = ctyjson.Marshal(as, as.Type())
 			if err != nil {
 				return err
@@ -246,6 +262,10 @@ func (p *plan) marshalResourceChanges(changes *plans.Changes, schemas *terraform
 		}
 
 		a, err := ctyjson.Marshal(afterUnknown, afterUnknown.Type())
+		if err != nil {
+			return err
+		}
+		replacePaths, err := encodePaths(rc.RequiredReplace)
 		if err != nil {
 			return err
 		}
@@ -257,6 +277,7 @@ func (p *plan) marshalResourceChanges(changes *plans.Changes, schemas *terraform
 			AfterUnknown:    a,
 			BeforeSensitive: json.RawMessage(beforeSensitive),
 			AfterSensitive:  json.RawMessage(afterSensitive),
+			ReplacePaths:    replacePaths,
 		}
 
 		if rc.DeposedKey != states.NotDeposed {
@@ -280,6 +301,19 @@ func (p *plan) marshalResourceChanges(changes *plans.Changes, schemas *terraform
 		r.Name = addr.Resource.Resource.Name
 		r.Type = addr.Resource.Resource.Type
 		r.ProviderName = rc.ProviderAddr.Provider.String()
+
+		switch rc.ActionReason {
+		case plans.ResourceInstanceChangeNoReason:
+			r.ActionReason = "" // will be omitted in output
+		case plans.ResourceInstanceReplaceBecauseCannotUpdate:
+			r.ActionReason = "replace_because_cannot_update"
+		case plans.ResourceInstanceReplaceBecauseTainted:
+			r.ActionReason = "replace_because_tainted"
+		case plans.ResourceInstanceReplaceByRequest:
+			r.ActionReason = "replace_by_request"
+		default:
+			return fmt.Errorf("resource %s has an unsupported action reason %s", r.Address, rc.ActionReason)
+		}
 
 		p.ResourceChanges = append(p.ResourceChanges, r)
 
@@ -603,4 +637,55 @@ func actionString(action string) []string {
 	default:
 		return []string{action}
 	}
+}
+
+// encodePaths lossily encodes a cty.PathSet into an array of arrays of step
+// values, such as:
+//
+//   [["length"],["triggers",0,"value"]]
+//
+// The lossiness is that we cannot distinguish between an IndexStep with string
+// key and a GetAttr step. This is fine with JSON output, because JSON's type
+// system means that those two steps are equivalent anyway: both are object
+// indexes.
+//
+// JavaScript (or similar dynamic language) consumers of these values can
+// recursively apply the steps to a given object using an index operation for
+// each step.
+func encodePaths(pathSet cty.PathSet) (json.RawMessage, error) {
+	if pathSet.Empty() {
+		return nil, nil
+	}
+
+	pathList := pathSet.List()
+	jsonPaths := make([]json.RawMessage, 0, len(pathList))
+
+	for _, path := range pathList {
+		steps := make([]json.RawMessage, 0, len(path))
+		for _, step := range path {
+			switch s := step.(type) {
+			case cty.IndexStep:
+				key, err := ctyjson.Marshal(s.Key, s.Key.Type())
+				if err != nil {
+					return nil, fmt.Errorf("Failed to marshal index step key %#v: %s", s.Key, err)
+				}
+				steps = append(steps, key)
+			case cty.GetAttrStep:
+				name, err := json.Marshal(s.Name)
+				if err != nil {
+					return nil, fmt.Errorf("Failed to marshal get attr step name %#v: %s", s.Name, err)
+				}
+				steps = append(steps, name)
+			default:
+				return nil, fmt.Errorf("Unsupported path step %#v (%t)", step, step)
+			}
+		}
+		jsonPath, err := json.Marshal(steps)
+		if err != nil {
+			return nil, err
+		}
+		jsonPaths = append(jsonPaths, jsonPath)
+	}
+
+	return json.Marshal(jsonPaths)
 }

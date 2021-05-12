@@ -30,7 +30,6 @@ import (
 // no color codes will be included.
 func ResourceChange(
 	change *plans.ResourceInstanceChangeSrc,
-	tainted bool,
 	schema *configschema.Block,
 	color *colorstring.Colorize,
 ) string {
@@ -58,9 +57,12 @@ func ResourceChange(
 	case plans.Update:
 		buf.WriteString(color.Color(fmt.Sprintf("[bold]  # %s[reset] will be updated in-place", dispAddr)))
 	case plans.CreateThenDelete, plans.DeleteThenCreate:
-		if tainted {
+		switch change.ActionReason {
+		case plans.ResourceInstanceReplaceBecauseTainted:
 			buf.WriteString(color.Color(fmt.Sprintf("[bold]  # %s[reset] is tainted, so must be [bold][red]replaced", dispAddr)))
-		} else {
+		case plans.ResourceInstanceReplaceByRequest:
+			buf.WriteString(color.Color(fmt.Sprintf("[bold]  # %s[reset] will be [bold][red]replaced[reset], as requested", dispAddr)))
+		default:
 			buf.WriteString(color.Color(fmt.Sprintf("[bold]  # %s[reset] must be [bold][red]replaced", dispAddr)))
 		}
 	case plans.Delete:
@@ -217,6 +219,7 @@ func (p *blockBodyDiffPrinter) writeBlockBodyDiff(schema *configschema.Block, ol
 
 	// write the attributes diff
 	blankBeforeBlocks := p.writeAttrsDiff(schema.Attributes, old, new, indent, path, &result)
+	p.writeSkippedAttr(result.skippedAttributes, indent+2)
 
 	{
 		blockTypeNames := make([]string, 0, len(schema.BlockTypes))
@@ -297,16 +300,6 @@ func (p *blockBodyDiffPrinter) writeAttrsDiff(
 		}
 	}
 
-	if result.skippedAttributes > 0 {
-		noun := "attributes"
-		if result.skippedAttributes == 1 {
-			noun = "attribute"
-		}
-		p.buf.WriteString("\n")
-		p.buf.WriteString(strings.Repeat(" ", indent+2))
-		p.buf.WriteString(p.color.Color(fmt.Sprintf("[dark_gray]# (%d unchanged %s hidden)[reset]", result.skippedAttributes, noun)))
-	}
-
 	return blankBeforeBlocks
 }
 
@@ -359,6 +352,9 @@ func (p *blockBodyDiffPrinter) writeAttrDiff(name string, attrS *configschema.At
 
 	if attrS.Sensitive {
 		p.buf.WriteString("(sensitive value)")
+		if p.pathForcesNewResource(path) {
+			p.buf.WriteString(p.color.Color(forcesNewResourceCaption))
+		}
 	} else {
 		switch {
 		case showJustNew:
@@ -400,17 +396,7 @@ func (p *blockBodyDiffPrinter) writeNestedAttrDiff(
 			p.buf.WriteString(p.color.Color(forcesNewResourceCaption))
 		}
 		p.writeAttrsDiff(objS.Attributes, old, new, indent+2, path, result)
-
-		if result.skippedAttributes > 0 {
-			noun := "attributes"
-			if result.skippedAttributes == 1 {
-				noun = "attribute"
-			}
-			p.buf.WriteString("\n")
-			p.buf.WriteString(strings.Repeat(" ", indent+2))
-			p.buf.WriteString(p.color.Color(fmt.Sprintf("[dark_gray]# (%d unchanged %s hidden)[reset]", result.skippedAttributes, noun)))
-		}
-
+		p.writeSkippedAttr(result.skippedAttributes, indent+4)
 		p.buf.WriteString("\n")
 		p.buf.WriteString(strings.Repeat(" ", indent))
 		p.buf.WriteString("}")
@@ -439,6 +425,9 @@ func (p *blockBodyDiffPrinter) writeNestedAttrDiff(
 		// of the lists will be presented as either creates (+) or deletes (-)
 		// depending on which list they belong to.
 		var commonLen int
+		// unchanged is the number of unchanged elements
+		var unchanged int
+
 		switch {
 		case len(oldItems) < len(newItems):
 			commonLen = len(oldItems)
@@ -451,25 +440,31 @@ func (p *blockBodyDiffPrinter) writeNestedAttrDiff(
 			newItem := newItems[i]
 			if oldItem.RawEquals(newItem) {
 				action = plans.NoOp
+				unchanged++
 			}
-			p.writeAttrsDiff(objS.Attributes, oldItem, newItem, indent+6, path, result)
+			if action != plans.NoOp {
+				p.writeAttrsDiff(objS.Attributes, oldItem, newItem, indent+6, path, result)
+				p.writeSkippedAttr(result.skippedAttributes, indent+8)
+				p.buf.WriteString("\n")
+			}
 		}
 		for i := commonLen; i < len(oldItems); i++ {
 			path := append(path, cty.IndexStep{Key: cty.NumberIntVal(int64(i))})
 			oldItem := oldItems[i]
 			newItem := cty.NullVal(oldItem.Type())
 			p.writeAttrsDiff(objS.Attributes, oldItem, newItem, indent+6, path, result)
+			p.buf.WriteString("\n")
 		}
 		for i := commonLen; i < len(newItems); i++ {
 			path := append(path, cty.IndexStep{Key: cty.NumberIntVal(int64(i))})
 			newItem := newItems[i]
 			oldItem := cty.NullVal(newItem.Type())
 			p.writeAttrsDiff(objS.Attributes, oldItem, newItem, indent+6, path, result)
+			p.buf.WriteString("\n")
 		}
-
-		p.buf.WriteString("\n")
 		p.buf.WriteString(strings.Repeat(" ", indent+4))
 		p.buf.WriteString("},\n")
+		p.writeSkippedElems(unchanged, indent+4)
 		p.buf.WriteString(strings.Repeat(" ", indent+2))
 		p.buf.WriteString("]")
 
@@ -543,8 +538,10 @@ func (p *blockBodyDiffPrinter) writeNestedAttrDiff(
 		}
 		sort.Strings(allKeysOrder)
 
-		p.buf.WriteString(" = {")
+		p.buf.WriteString(" = {\n")
 
+		// unchanged tracks the number of unchanged elements
+		unchanged := 0
 		for _, k := range allKeysOrder {
 			var action plans.Action
 			oldValue := oldItems[k]
@@ -560,26 +557,27 @@ func (p *blockBodyDiffPrinter) writeNestedAttrDiff(
 				action = plans.Update
 			default:
 				action = plans.NoOp
+				unchanged++
 			}
 
-			p.buf.WriteString("\n")
-			p.buf.WriteString(strings.Repeat(" ", indent+4))
-			p.writeActionSymbol(action)
+			if action != plans.NoOp {
+				p.buf.WriteString(strings.Repeat(" ", indent+4))
+				p.writeActionSymbol(action)
+				fmt.Fprintf(p.buf, "%q = {", k)
+				if p.pathForcesNewResource(path) || p.pathForcesNewResource(path[:len(path)-1]) {
+					p.buf.WriteString(p.color.Color(forcesNewResourceCaption))
+				}
 
-			fmt.Fprintf(p.buf, "%q = {", k)
-			if action != plans.NoOp && (p.pathForcesNewResource(path) || p.pathForcesNewResource(path[:len(path)-1])) {
-				p.buf.WriteString(p.color.Color(forcesNewResourceCaption))
+				path := append(path, cty.IndexStep{Key: cty.StringVal(k)})
+				p.writeAttrsDiff(objS.Attributes, oldValue, newValue, indent+6, path, result)
+				p.writeSkippedAttr(result.skippedAttributes, indent+8)
+				p.buf.WriteString("\n")
+				p.buf.WriteString(strings.Repeat(" ", indent+4))
+				p.buf.WriteString("},\n")
 			}
-
-			path := append(path, cty.IndexStep{Key: cty.StringVal(k)})
-
-			p.writeAttrsDiff(objS.Attributes, oldValue, newValue, indent+6, path, result)
-			p.buf.WriteString("\n")
-			p.buf.WriteString(strings.Repeat(" ", indent+4))
-			p.buf.WriteString("},")
 		}
 
-		p.buf.WriteString("\n")
+		p.writeSkippedElems(unchanged, indent+4)
 		p.buf.WriteString(strings.Repeat(" ", indent+2))
 		p.buf.WriteString("}")
 	}
@@ -1830,4 +1828,28 @@ func DiffActionSymbol(action plans.Action) string {
 // enough.
 func identifyingAttribute(name string, attrSchema *configschema.Attribute) bool {
 	return name == "id" || name == "tags" || name == "name"
+}
+
+func (p *blockBodyDiffPrinter) writeSkippedAttr(skipped, indent int) {
+	if skipped > 0 {
+		noun := "attributes"
+		if skipped == 1 {
+			noun = "attribute"
+		}
+		p.buf.WriteString("\n")
+		p.buf.WriteString(strings.Repeat(" ", indent))
+		p.buf.WriteString(p.color.Color(fmt.Sprintf("[dark_gray]# (%d unchanged %s hidden)[reset]", skipped, noun)))
+	}
+}
+
+func (p *blockBodyDiffPrinter) writeSkippedElems(skipped, indent int) {
+	if skipped > 0 {
+		noun := "elements"
+		if skipped == 1 {
+			noun = "element"
+		}
+		p.buf.WriteString(strings.Repeat(" ", indent))
+		p.buf.WriteString(p.color.Color(fmt.Sprintf("[dark_gray]# (%d unchanged %s hidden)[reset]", skipped, noun)))
+		p.buf.WriteString("\n")
+	}
 }

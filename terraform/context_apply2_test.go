@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform/addrs"
+	"github.com/hashicorp/terraform/configs/configschema"
+	"github.com/hashicorp/terraform/plans"
 	"github.com/hashicorp/terraform/providers"
 	"github.com/hashicorp/terraform/states"
 	"github.com/zclconf/go-cty/cty"
@@ -160,7 +162,7 @@ output "data" {
 	ctx = testContext2(t, &ContextOpts{
 		Config:    m,
 		Providers: ps,
-		Destroy:   true,
+		PlanMode:  plans.DestroyMode,
 	})
 
 	_, diags = ctx.Plan()
@@ -331,22 +333,22 @@ resource "aws_instance" "bin" {
 		t.Fatal(diags.Err())
 	}
 
-	bar := plan.State.ResourceInstance(barAddr)
+	bar := plan.PriorState.ResourceInstance(barAddr)
 	if len(bar.Current.Dependencies) == 0 || !bar.Current.Dependencies[0].Equal(fooAddr.ContainingResource().Config()) {
 		t.Fatalf("bar should depend on foo after refresh, but got %s", bar.Current.Dependencies)
 	}
 
-	foo := plan.State.ResourceInstance(fooAddr)
+	foo := plan.PriorState.ResourceInstance(fooAddr)
 	if len(foo.Current.Dependencies) == 0 || !foo.Current.Dependencies[0].Equal(bazAddr.ContainingResource().Config()) {
 		t.Fatalf("foo should depend on baz after refresh because of the update, but got %s", foo.Current.Dependencies)
 	}
 
-	bin := plan.State.ResourceInstance(binAddr)
+	bin := plan.PriorState.ResourceInstance(binAddr)
 	if len(bin.Current.Dependencies) != 0 {
 		t.Fatalf("bin should depend on nothing after refresh because there is no change, but got %s", bin.Current.Dependencies)
 	}
 
-	baz := plan.State.ResourceInstance(bazAddr)
+	baz := plan.PriorState.ResourceInstance(bazAddr)
 	if len(baz.Current.Dependencies) == 0 || !baz.Current.Dependencies[0].Equal(bamAddr.ContainingResource().Config()) {
 		t.Fatalf("baz should depend on bam after refresh, but got %s", baz.Current.Dependencies)
 	}
@@ -355,8 +357,6 @@ resource "aws_instance" "bin" {
 	if diags.HasErrors() {
 		t.Fatal(diags.Err())
 	}
-
-	fmt.Println(state)
 
 	bar = state.ResourceInstance(barAddr)
 	if len(bar.Current.Dependencies) == 0 || !bar.Current.Dependencies[0].Equal(fooAddr.ContainingResource().Config()) {
@@ -368,4 +368,81 @@ resource "aws_instance" "bin" {
 		t.Fatalf("foo should have no deps after apply, but got %s", foo.Current.Dependencies)
 	}
 
+}
+
+func TestContext2Apply_additionalSensitiveFromState(t *testing.T) {
+	// Ensure we're not trying to double-mark values decoded from state
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+variable "secret" {
+  sensitive = true
+  default = ["secret"]
+}
+
+resource "test_resource" "a" {
+  sensitive_attr = var.secret
+}
+
+resource "test_resource" "b" {
+  value = test_resource.a.id
+}
+`,
+	})
+
+	p := new(MockProvider)
+	p.GetProviderSchemaResponse = getProviderSchemaResponseFromProviderSchema(&ProviderSchema{
+		ResourceTypes: map[string]*configschema.Block{
+			"test_resource": {
+				Attributes: map[string]*configschema.Attribute{
+					"id": {
+						Type:     cty.String,
+						Computed: true,
+					},
+					"value": {
+						Type:     cty.String,
+						Optional: true,
+					},
+					"sensitive_attr": {
+						Type:      cty.List(cty.String),
+						Optional:  true,
+						Sensitive: true,
+					},
+				},
+			},
+		},
+	})
+
+	state := states.BuildState(func(s *states.SyncState) {
+		s.SetResourceInstanceCurrent(
+			mustResourceInstanceAddr(`test_resource.a`),
+			&states.ResourceInstanceObjectSrc{
+				AttrsJSON: []byte(`{"id":"a","sensitive_attr":["secret"]}`),
+				AttrSensitivePaths: []cty.PathValueMarks{
+					{
+						Path:  cty.GetAttrPath("sensitive_attr"),
+						Marks: cty.NewValueMarks("sensitive"),
+					},
+				},
+				Status: states.ObjectReady,
+			}, mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`),
+		)
+	})
+
+	ctx := testContext2(t, &ContextOpts{
+		Config: m,
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+		State: state,
+	})
+
+	_, diags := ctx.Plan()
+	if diags.HasErrors() {
+		t.Fatal(diags.ErrWithWarnings())
+	}
+
+	_, diags = ctx.Apply()
+	if diags.HasErrors() {
+		t.Fatal(diags.ErrWithWarnings())
+	}
 }

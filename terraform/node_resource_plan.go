@@ -1,7 +1,9 @@
 package terraform
 
 import (
+	"fmt"
 	"log"
+	"strings"
 
 	"github.com/hashicorp/terraform/addrs"
 	"github.com/hashicorp/terraform/dag"
@@ -23,6 +25,16 @@ type nodeExpandPlannableResource struct {
 
 	// skipRefresh indicates that we should skip refreshing individual instances
 	skipRefresh bool
+
+	// skipPlanChanges indicates we should skip trying to plan change actions
+	// for any instances.
+	skipPlanChanges bool
+
+	// forceReplace are resource instance addresses where the user wants to
+	// force generating a replace action. This set isn't pre-filtered, so
+	// it might contain addresses that have nothing to do with the resource
+	// that this node represents, which the node itself must therefore ignore.
+	forceReplace []addrs.AbsResourceInstance
 
 	// We attach dependencies to the Resource during refresh, since the
 	// instances are instantiated during DynamicExpand.
@@ -84,6 +96,8 @@ func (n *nodeExpandPlannableResource) DynamicExpand(ctx EvalContext) (*Graph, er
 			ForceCreateBeforeDestroy: n.ForceCreateBeforeDestroy,
 			dependencies:             n.dependencies,
 			skipRefresh:              n.skipRefresh,
+			skipPlanChanges:          n.skipPlanChanges,
+			forceReplace:             n.forceReplace,
 		})
 	}
 
@@ -149,6 +163,16 @@ type NodePlannableResource struct {
 	// skipRefresh indicates that we should skip refreshing individual instances
 	skipRefresh bool
 
+	// skipPlanChanges indicates we should skip trying to plan change actions
+	// for any instances.
+	skipPlanChanges bool
+
+	// forceReplace are resource instance addresses where the user wants to
+	// force generating a replace action. This set isn't pre-filtered, so
+	// it might contain addresses that have nothing to do with the resource
+	// that this node represents, which the node itself must therefore ignore.
+	forceReplace []addrs.AbsResourceInstance
+
 	dependencies []addrs.ConfigResource
 }
 
@@ -172,13 +196,88 @@ func (n *NodePlannableResource) Name() string {
 
 // GraphNodeExecutable
 func (n *NodePlannableResource) Execute(ctx EvalContext, op walkOperation) tfdiags.Diagnostics {
+	var diags tfdiags.Diagnostics
+
 	if n.Config == nil {
 		// Nothing to do, then.
 		log.Printf("[TRACE] NodeApplyableResource: no configuration present for %s", n.Name())
-		return nil
+		return diags
 	}
 
-	return n.writeResourceState(ctx, n.Addr)
+	// writeResourceState is responsible for informing the expander of what
+	// repetition mode this resource has, which allows expander.ExpandResource
+	// to work below.
+	moreDiags := n.writeResourceState(ctx, n.Addr)
+	diags = diags.Append(moreDiags)
+	if moreDiags.HasErrors() {
+		return diags
+	}
+
+	// Before we expand our resource into potentially many resource instances,
+	// we'll verify that any mention of this resource in n.forceReplace is
+	// consistent with the repetition mode of the resource. In other words,
+	// we're aiming to catch a situation where naming a particular resource
+	// instance would require an instance key but the given address has none.
+	expander := ctx.InstanceExpander()
+	instanceAddrs := expander.ExpandResource(n.ResourceAddr().Absolute(ctx.Path()))
+
+	// If there's a number of instances other than 1 then we definitely need
+	// an index.
+	mustHaveIndex := len(instanceAddrs) != 1
+	// If there's only one instance then we might still need an index, if the
+	// instance address has one.
+	if len(instanceAddrs) == 1 && instanceAddrs[0].Resource.Key != addrs.NoKey {
+		mustHaveIndex = true
+	}
+	if mustHaveIndex {
+		for _, candidateAddr := range n.forceReplace {
+			if candidateAddr.Resource.Key == addrs.NoKey {
+				if n.Addr.Resource.Equal(candidateAddr.Resource.Resource) {
+					switch {
+					case len(instanceAddrs) == 0:
+						// In this case there _are_ no instances to replace, so
+						// there isn't any alternative address for us to suggest.
+						diags = diags.Append(tfdiags.Sourceless(
+							tfdiags.Warning,
+							"Incompletely-matched force-replace resource instance",
+							fmt.Sprintf(
+								"Your force-replace request for %s doesn't match any resource instances because this resource doesn't have any instances.",
+								candidateAddr,
+							),
+						))
+					case len(instanceAddrs) == 1:
+						diags = diags.Append(tfdiags.Sourceless(
+							tfdiags.Warning,
+							"Incompletely-matched force-replace resource instance",
+							fmt.Sprintf(
+								"Your force-replace request for %s doesn't match any resource instances because it lacks an instance key.\n\nTo force replacement of the single declared instance, use the following option instead:\n  -replace=%q",
+								candidateAddr, instanceAddrs[0],
+							),
+						))
+					default:
+						var possibleValidOptions strings.Builder
+						for _, addr := range instanceAddrs {
+							fmt.Fprintf(&possibleValidOptions, "\n  -replace=%q", addr)
+						}
+
+						diags = diags.Append(tfdiags.Sourceless(
+							tfdiags.Warning,
+							"Incompletely-matched force-replace resource instance",
+							fmt.Sprintf(
+								"Your force-replace request for %s doesn't match any resource instances because it lacks an instance key.\n\nTo force replacement of particular instances, use one or more of the following options instead:%s",
+								candidateAddr, possibleValidOptions.String(),
+							),
+						))
+					}
+				}
+			}
+		}
+	}
+	// NOTE: The actual interpretation of n.forceReplace to produce replace
+	// actions is in NodeAbstractResourceInstance.plan, because we must do so
+	// on a per-instance basis rather than for the whole resource.
+
+	return diags
 }
 
 // GraphNodeDestroyerCBD
@@ -239,6 +338,8 @@ func (n *NodePlannableResource) DynamicExpand(ctx EvalContext) (*Graph, error) {
 			// nodes that have it.
 			ForceCreateBeforeDestroy: n.CreateBeforeDestroy(),
 			skipRefresh:              n.skipRefresh,
+			skipPlanChanges:          n.skipPlanChanges,
+			forceReplace:             n.forceReplace,
 		}
 	}
 
@@ -253,6 +354,7 @@ func (n *NodePlannableResource) DynamicExpand(ctx EvalContext) (*Graph, error) {
 
 		return &NodePlannableResourceInstanceOrphan{
 			NodeAbstractResourceInstance: a,
+			skipRefresh:                  n.skipRefresh,
 		}
 	}
 

@@ -30,6 +30,7 @@ type Diagnostic struct {
 	Severity string             `json:"severity"`
 	Summary  string             `json:"summary"`
 	Detail   string             `json:"detail"`
+	Address  string             `json:"address,omitempty"`
 	Range    *DiagnosticRange   `json:"range,omitempty"`
 	Snippet  *DiagnosticSnippet `json:"snippet,omitempty"`
 }
@@ -124,6 +125,7 @@ func NewDiagnostic(diag tfdiags.Diagnostic, sources map[string][]byte) *Diagnost
 		Severity: sev,
 		Summary:  desc.Summary,
 		Detail:   desc.Detail,
+		Address:  desc.Address,
 	}
 
 	sourceRefs := diag.Source()
@@ -131,6 +133,12 @@ func NewDiagnostic(diag tfdiags.Diagnostic, sources map[string][]byte) *Diagnost
 		// We'll borrow HCL's range implementation here, because it has some
 		// handy features to help us produce a nice source code snippet.
 		highlightRange := sourceRefs.Subject.ToHCL()
+
+		// Some diagnostic sources fail to set the end of the subject range.
+		if highlightRange.End == (hcl.Pos{}) {
+			highlightRange.End = highlightRange.Start
+		}
+
 		snippetRange := highlightRange
 		if sourceRefs.Context != nil {
 			snippetRange = sourceRefs.Context.ToHCL()
@@ -315,9 +323,19 @@ func compactValueStr(val cty.Value) string {
 	// helpful but concise messages in diagnostics. It is not comprehensive
 	// nor intended to be used for other purposes.
 
-	if val.ContainsMarked() {
+	if val.IsMarked() {
+		// We check this in here just to make sure, but note that the caller
+		// of compactValueStr ought to have already checked this and skipped
+		// calling into compactValueStr anyway, so this shouldn't actually
+		// be reachable.
 		return "(sensitive value)"
 	}
+
+	// WARNING: We've only checked that the value isn't sensitive _shallowly_
+	// here, and so we must never show any element values from complex types
+	// in here. However, it's fine to show map keys and attribute names because
+	// those are never sensitive in isolation: the entire value would be
+	// sensitive in that case.
 
 	ty := val.Type()
 	switch {
