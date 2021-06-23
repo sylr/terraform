@@ -120,6 +120,9 @@ supported only by the `terraform plan` command, and not by the
 `terraform apply` command. To create and apply a plan in destroy mode in
 earlier versions you must run [`terraform destroy`](./destroy.html).
 
+-> **Note:** The `-refresh-only` option is available only in Terraform v0.15.4
+and later.
+
 ## Planning Options
 
 In addition to the planning _modes_ described above, there are also several
@@ -157,7 +160,7 @@ the previous section, are also available with the same meanings on
     This option is allowed only in the normal planning mode, so this option
     is incompatible with the `-destroy` option.
 
-    The `-replace=...` option is available only from Terraform v1.0 onwards.
+    The `-replace=...` option is available only from Terraform v0.15.2 onwards.
     For earlier versions, you can achieve a similar effect (with some caveats)
     using [`terraform taint`](./taint.html).
 
@@ -254,6 +257,12 @@ The available options are:
   input for root module input variables that have not otherwise been assigned
   a value. This option is particular useful when running Terraform in
   non-interactive automation systems.
+
+* `-json` - Enables the [machine readable JSON UI][machine-readable-ui] output.
+  This implies `-input=false`, so the configuration must have no unassigned
+  variable values to continue.
+
+  [machine-readable-ui]: /docs/internals/machine-readable-ui.html
 
 * `-lock=false` - Don't hold a state lock during the operation. This is
    dangerous if others might concurrently run commands against the same
